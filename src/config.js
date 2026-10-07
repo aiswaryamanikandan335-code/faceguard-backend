@@ -8,7 +8,9 @@ function required(name) {
 }
 
 const storageDriver = process.env.STORAGE_DRIVER || 'cloudinary'; // 'memory' only for tests
-const mailDriver = process.env.MAIL_DRIVER || (process.env.SMTP_USER ? 'smtp' : 'console');
+// Brevo sends over HTTPS (Render's free plan blocks the SMTP ports, so Gmail SMTP cannot work there).
+const mailDriver = process.env.MAIL_DRIVER ||
+  (process.env.BREVO_API_KEY ? 'brevo' : process.env.SMTP_USER ? 'smtp' : 'console');
 
 const config = {
   port: Number(process.env.PORT || 3000),
@@ -32,6 +34,12 @@ const config = {
         user: required('SMTP_USER'),
         pass: required('SMTP_PASS'),
         from: process.env.MAIL_FROM || `FaceGuard <${process.env.SMTP_USER}>`,
+      }
+    : null,
+  brevo: mailDriver === 'brevo'
+    ? {
+        apiKey: required('BREVO_API_KEY'),
+        from: required('MAIL_FROM'), // "FaceGuard <you@gmail.com>": the address verified as a sender in Brevo
       }
     : null,
   faceUrlSeconds: 60 * 60,          // face photo links expire after 1 hour
