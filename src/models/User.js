@@ -14,6 +14,8 @@ const userSchema = new mongoose.Schema(
       version: Number,
       format: String,
     },
+    // "Sign in with Face": 128 numbers describing the face (see face.js). Not a photo; never sent to the app.
+    faceDescriptor: { type: [Number], select: false, default: undefined },
 
     // Sign-in protection
     failedLogins: { type: Number, default: 0 },

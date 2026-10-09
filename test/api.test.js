@@ -2,6 +2,7 @@
 process.env.NODE_ENV = 'test';
 process.env.STORAGE_DRIVER = 'memory';
 process.env.MAIL_DRIVER = 'console';
+process.env.FACE_DRIVER = 'fake'; // same photo bytes = same face; no recognition models in tests
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-1234567890';
 
 const { test, before, after } = require('node:test');
@@ -96,6 +97,40 @@ test('login by email or phone returns a token; profile needs that token', async 
   assert.equal(p.body.user.fullName, 'Aiswarya');
   assert.equal(p.body.user.gender, 'Female');
   assert.match(p.body.user.faceUrl, /^memory:\/\/faceguard\/faces\//);
+});
+
+test('sign in with face: the registered face signs in its own account; other faces are refused', async () => {
+  const otherFace = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 2]);
+  const created = await signup({ email: 'second@gmail.com', phone: '9123412345' }, otherFace);
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const stored = await User.findOne({ email: 'second@gmail.com' }).select('+faceDescriptor').lean();
+  assert.equal(stored.faceDescriptor.length, 128);
+  assert.equal(created.body.user.faceDescriptor, undefined); // never sent to the app
+
+  const sameFaceAgain = await signup({ email: 'third@gmail.com', phone: '9123498765' }, otherFace);
+  assert.equal(sameFaceAgain.status, 409);
+  assert.match(sameFaceAgain.body.error, /face is already registered/);
+  assert.equal(await User.exists({ email: 'third@gmail.com' }), null);
+
+  const faceLogin = (photo) => request(app).post('/api/auth/face-login').attach('faceImage', photo, { filename: 'face.jpg', contentType: 'image/jpeg' });
+
+  const first = await faceLogin(JPEG);
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.user.email, 'aiswarya@gmail.com');
+  assert.ok(first.body.token);
+  const p = await request(app).get('/api/profile').set('Authorization', `Bearer ${first.body.token}`);
+  assert.equal(p.body.user.email, 'aiswarya@gmail.com');
+
+  const second = await faceLogin(otherFace);
+  assert.equal(second.body.user.email, 'second@gmail.com');
+
+  const stranger = await faceLogin(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 3]));
+  assert.equal(stranger.status, 401);
+  assert.match(stranger.body.error, /Face not recognised/);
+
+  const notImage = await request(app).post('/api/auth/face-login').attach('faceImage', Buffer.from('nope'), 'face.jpg');
+  assert.equal(notImage.status, 400);
+  await User.deleteOne({ email: 'second@gmail.com' });
 });
 
 test('wrong password: same message as unknown user, then a lock after 5 tries', async () => {

@@ -8,6 +8,7 @@ const config = require('./config');
 const User = require('./models/User');
 const storage = require('./storage');
 const mail = require('./mail');
+const face = require('./face');
 const { issueToken, requireAuth } = require('./auth');
 
 const router = express.Router();
@@ -19,6 +20,7 @@ const PHONE = /^[6-9]\d{9}$/;
 const GENDERS = ['Female', 'Male', 'Prefer not to say'];
 const ALREADY_EMAIL = 'An account with this email already exists. Please Sign In.';
 const ALREADY_PHONE = 'An account with this phone number already exists. Please Sign In.';
+const ALREADY_FACE = 'This face is already registered to another account. Please Sign In.';
 
 const normEmail = (v) => String(v || '').trim().toLowerCase();
 const normPhone = (v) => String(v || '').replace(/\D/g, '').slice(-10);
@@ -36,6 +38,22 @@ function isImage(buf) {
   const jpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
   const png = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
   return jpeg || png;
+}
+
+/** Face descriptor for "Sign in with Face"; null (never an error) so a recognition problem can't block sign-up. */
+async function describeOrNull(buffer) {
+  try {
+    return (await face.describe(buffer)) || undefined;
+  } catch (e) {
+    console.error('[face] describe failed:', e.message);
+    return undefined;
+  }
+}
+
+/** Is this face already the registered face of some account? */
+async function faceAlreadyRegistered(descriptor) {
+  const others = await User.find({ 'faceDescriptor.0': { $exists: true } }).select('faceDescriptor').lean();
+  return others.some((u) => face.distance(descriptor, u.faceDescriptor) <= face.MATCH_DISTANCE);
 }
 
 const otpHash = (email, code) => crypto.createHmac('sha256', config.jwtSecret).update(`${email}:${code}`).digest('hex');
@@ -91,6 +109,12 @@ router.post('/auth/signup', limiter(10, 15), upload.single('faceImage'), async (
   if (await User.exists({ email })) return res.status(409).json({ error: ALREADY_EMAIL, field: 'email' });
   if (await User.exists({ phone })) return res.status(409).json({ error: ALREADY_PHONE, field: 'phone' });
 
+  // One face, one account: otherwise "Sign in with Face" could not tell which account the face belongs to.
+  const faceDescriptor = await describeOrNull(req.file.buffer);
+  if (faceDescriptor && (await faceAlreadyRegistered(faceDescriptor))) {
+    return res.status(409).json({ error: ALREADY_FACE, field: 'face' });
+  }
+
   const passwordHash = await bcrypt.hash(password, 12);
   let user;
   try {
@@ -105,6 +129,7 @@ router.post('/auth/signup', limiter(10, 15), upload.single('faceImage'), async (
 
   try {
     user.face = await storage.upload(req.file.buffer, user._id.toString());
+    user.faceDescriptor = faceDescriptor; // for "Sign in with Face"
     await user.save();
   } catch (e) {
     console.error('[signup] face upload failed:', e.message);
@@ -150,6 +175,36 @@ router.post('/auth/login', limiter(20, 15), async (req, res) => {
   user.failedLogins = 0;
   user.lockedUntil = undefined;
   await user.save();
+  res.json({ token: issueToken(user), user: user.publicProfile(storage.url(user.face)) });
+});
+
+/**
+ * Sign in with Face: the app sends a face photo taken right after its liveness check (multipart field "faceImage").
+ * The server finds whose registered face it is and, for a confident match, signs that account in.
+ */
+router.post('/auth/face-login', limiter(15, 15), upload.single('faceImage'), async (req, res) => {
+  if (!req.file || !isImage(req.file.buffer)) return res.status(400).json({ error: 'The face photo is missing.' });
+
+  let descriptor;
+  try {
+    descriptor = await face.describe(req.file.buffer);
+  } catch (e) {
+    console.error('[face-login] describe failed:', e.message);
+    return res.status(503).json({ error: 'Face sign-in is not available right now. Please sign in with your password.' });
+  }
+  if (!descriptor) return res.status(400).json({ error: 'No face found. Look straight at the camera and try again.' });
+
+  const candidates = await User.find({ 'faceDescriptor.0': { $exists: true } }).select('_id faceDescriptor').lean();
+  const match = face.bestMatch(descriptor, candidates.map((u) => ({ id: u._id.toString(), descriptor: u.faceDescriptor })));
+  if (!match) return res.status(401).json({ error: 'Face not recognised. Try again or sign in with your password.' });
+
+  const user = await User.findById(match.id);
+  if (!user) return res.status(401).json({ error: 'Face not recognised. Try again or sign in with your password.' });
+  if (user.lockedUntil && user.lockedUntil > new Date()) {
+    const seconds = Math.ceil((user.lockedUntil - Date.now()) / 1000);
+    return res.status(423).json({ error: `Too many failed attempts. Try again in ${seconds} seconds.`, retryAfter: seconds });
+  }
+  console.log(`[face-login] signed in ${user._id} (distance ${match.distance.toFixed(3)})`);
   res.json({ token: issueToken(user), user: user.publicProfile(storage.url(user.face)) });
 });
 
